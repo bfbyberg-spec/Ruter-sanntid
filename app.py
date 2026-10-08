@@ -155,6 +155,7 @@ def _trip_patterns(
 ) -> list[dict[str, Any]]:
     mode_clause = ""
     if transport_mode:
+        transport_mode = _mode_from_filter(transport_mode)
         mode_clause = (
             "modes: { accessMode: foot, egressMode: foot, directMode: foot, "
             f"transportModes: [{{ transportMode: {transport_mode} }}] }}"
@@ -248,9 +249,9 @@ def _normalise_trip(pattern: dict[str, Any]) -> dict[str, Any]:
 
 
 def _mode_from_filter(value: str | None) -> str | None:
-    if not value:
+    if value is None:
         return None
-    v = value.casefold().strip().replace("-", " ")
+    v = " ".join(value.casefold().strip().replace("-", " ").split())
     aliases = {
         "metro": "metro",
         "bane": "metro",
@@ -264,36 +265,68 @@ def _mode_from_filter(value: str | None) -> str | None:
         "rail": "rail",
         "tog": "rail",
         "train": "rail",
+        "coach": "coach",
+        "water": "water",
+        "ferry": "water",
+        "ferge": "water",
+        "båt": "water",
+        "air": "air",
+        "fly": "air",
     }
-    return aliases.get(v)
+    if v not in aliases:
+        raise ValueError("Ukjent transportmiddel. Bruk metro/T-bane, bus/buss, tram/trikk, rail/tog, coach, water/ferge eller air/fly.")
+    return aliases[v]
+
+
+def _transit_legs(pattern: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        leg for leg in pattern.get("legs", [])
+        if leg.get("line") or str(leg.get("mode") or "").casefold() not in ("foot", "walk", "walking")
+    ]
 
 
 @mcp.tool()
-def next_departure(from_stop: str, destination: str, line: str | None = None) -> dict[str, Any]:
-    """FAST PATH. Find the next real journey from a named stop to another named stop. Optional line can be a line number, or a mode word such as metro/bane/T-bane, bus/buss, tram/trikk or rail/tog to restrict the journey search."""
+def next_departure(
+    from_stop: str,
+    destination: str,
+    line: str | None = None,
+    transport_mode: str | None = None,
+) -> dict[str, Any]:
+    """FAST PATH. Find the next real point-to-point journey. Set transport_mode='metro' for only T-bane, 'bus' for only buses, 'tram', 'rail', 'coach', 'water' or 'air'; Norwegian aliases are accepted. Omit transport_mode for all modes. Optional line restricts journeys to those containing that line, while transfers may use other lines of the selected mode. Legacy mode words in line (metro/bane/T-bane, bus/buss, tram/trikk, rail/tog) remain supported. Never substitute a different mode when no matching journey exists."""
+    mode_filter = _mode_from_filter(transport_mode)
+    legacy_mode = None
+    line_filter = line.strip() if line else None
+    if line_filter:
+        try:
+            legacy_mode = _mode_from_filter(line_filter)
+        except ValueError:
+            pass  # An unrecognised mode word can still be a public line code.
+    if legacy_mode:
+        if mode_filter and mode_filter != legacy_mode:
+            raise ValueError("Transportmiddelet i line og transport_mode er motstridende.")
+        mode_filter = legacy_mode
+        line_filter = None
+
     origin = _search_stop(from_stop)
     dest = _search_stop(destination)
 
-    mode_filter = _mode_from_filter(line)
     patterns = [
         _normalise_trip(p)
         for p in _trip_patterns(origin["id"], dest["id"], 8, transport_mode=mode_filter)
     ]
 
-    if line and not mode_filter:
-        line_cf = line.casefold().strip()
-        filtered = []
-        for p in patterns:
-            if any(str(l.get("line") or "").casefold() == line_cf for l in p.get("legs", [])):
-                filtered.append(p)
-        if filtered:
-            patterns = filtered
+    if line_filter:
+        line_cf = line_filter.casefold()
+        patterns = [
+            p for p in patterns
+            if any(str(leg.get("line") or "").casefold() == line_cf for leg in _transit_legs(p))
+        ]
 
     if mode_filter:
         # Defensive post-filter in addition to the OTP mode restriction.
         filtered = []
         for p in patterns:
-            transit = [l for l in p.get("legs", []) if l.get("line")]
+            transit = _transit_legs(p)
             if transit and all(str(l.get("transport_mode") or l.get("mode") or "").casefold() == mode_filter for l in transit):
                 filtered.append(p)
         patterns = filtered
@@ -305,7 +338,7 @@ def next_departure(from_stop: str, destination: str, line: str | None = None) ->
             "from_stop": origin["name"],
             "to_stop": dest["name"],
             "mode_filter": mode_filter,
-            "line_filter": None if mode_filter else line,
+            "line_filter": line_filter,
             "message": "Ingen reiser funnet akkurat nå med valgt filter.",
             "retrieved_at": datetime.now().astimezone().isoformat(),
         }
@@ -316,7 +349,7 @@ def next_departure(from_stop: str, destination: str, line: str | None = None) ->
         "from_stop": origin["name"],
         "to_stop": dest["name"],
         "mode_filter": mode_filter,
-        "line_filter": None if mode_filter else line,
+        "line_filter": line_filter,
         "line": best.get("first_line"),
         "transport_mode": best.get("first_mode"),
         "destination": best.get("first_destination_display") or dest["name"],
