@@ -16,7 +16,6 @@ HEADERS = {
     "User-Agent": CLIENT_NAME,
 }
 
-# Tiny in-process cache. Stop IDs are effectively stable and this avoids repeated geocoder calls.
 _STOP_CACHE: dict[str, dict[str, Any]] = {}
 
 
@@ -24,12 +23,12 @@ def _client() -> httpx.Client:
     return httpx.Client(timeout=15.0, headers=HEADERS)
 
 
-def _graphql(query: str, variables: dict[str, Any]) -> dict[str, Any]:
+def _graphql(query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]:
     with _client() as client:
         r = client.post(
             JOURNEY_URL,
             headers={"Content-Type": "application/json"},
-            json={"query": query, "variables": variables},
+            json={"query": query, "variables": variables or {}},
         )
         r.raise_for_status()
         payload = r.json()
@@ -53,11 +52,18 @@ def _search_stop(name: str) -> dict[str, Any]:
     if not features:
         raise ValueError(f"Fant ikke stoppested: {name}")
 
-    # Prefer metro stop places when present, then the first result.
-    def score(feature: dict[str, Any]) -> int:
+    # Prefer a result that actually represents public transport; metro gets a slight
+    # preference only when otherwise equivalent. Mixed stops (bus+metro) are retained.
+    def score(feature: dict[str, Any]) -> tuple[int, int]:
         p = feature.get("properties", {})
-        modes = [str(x).lower() for x in (p.get("transportModes") or [])]
-        return 0 if "metro" in modes else 1
+        modes_raw = p.get("transportModes") or []
+        modes = []
+        for x in modes_raw:
+            if isinstance(x, dict):
+                modes.append(str(x.get("mode", "")).lower())
+            else:
+                modes.append(str(x).lower())
+        return (0 if modes else 1, 0 if "metro" in modes else 1)
 
     feature = sorted(features, key=score)[0]
     p = feature.get("properties", {})
@@ -143,60 +149,137 @@ def _departure_board(stop_place_id: str, number_of_departures: int = 40, time_ra
     }
 
 
-def _mins_between(a: str, b: str) -> float:
-    return (datetime.fromisoformat(b) - datetime.fromisoformat(a)).total_seconds() / 60.0
+def _trip_patterns(from_stop_id: str, to_stop_id: str, num_patterns: int = 6) -> list[dict[str, Any]]:
+    # IDs are canonical Entur IDs returned by our own geocoder, not user supplied text.
+    query = f"""
+    {{
+      trip(
+        from: {{ place: \"{from_stop_id}\" }}
+        to: {{ place: \"{to_stop_id}\" }}
+        numTripPatterns: {max(1, min(num_patterns, 10))}
+      ) {{
+        tripPatterns {{
+          duration
+          expectedStartTime
+          expectedEndTime
+          legs {{
+            mode
+            duration
+            fromPlace {{ name }}
+            toPlace {{ name }}
+            aimedStartTime
+            expectedStartTime
+            aimedEndTime
+            expectedEndTime
+            line {{
+              publicCode
+              name
+              transportMode
+            }}
+            fromEstimatedCall {{
+              destinationDisplay {{ frontText }}
+            }}
+          }}
+        }}
+      }}
+    }}
+    """
+    data = _graphql(query)
+    return ((data.get("trip") or {}).get("tripPatterns") or [])
 
 
-@mcp.tool()
-def next_departure(from_stop: str, destination: str, line: str | None = None) -> dict[str, Any]:
-    """FAST PATH. In one MCP call, find the next live departure from a named stop toward a destination. Optionally filter by line number. Use this for questions like 'Neste bane fra Ringstabekk til Kolsås?'."""
-    stop = _search_stop(from_stop)
-    board = _departure_board(stop["id"], number_of_departures=50, time_range_seconds=14400)
-
-    dest_cf = destination.casefold().strip()
-    line_cf = line.casefold().strip() if line else None
-    matches = []
-    for d in board.get("departures", []):
-        if d.get("cancelled"):
-            continue
-        d_dest = (d.get("destination") or "").casefold()
-        d_line = str(d.get("line") or "").casefold()
-        if dest_cf not in d_dest:
-            continue
-        if line_cf and line_cf != d_line:
-            continue
-        matches.append(d)
-
-    if not matches:
-        return {
-            "from_stop": board.get("stop_name") or stop["name"],
-            "destination_filter": destination,
-            "line_filter": line,
-            "found": False,
-            "message": "Ingen matchende avganger funnet i søkevinduet.",
-            "retrieved_at": board.get("retrieved_at"),
+def _normalise_trip(pattern: dict[str, Any]) -> dict[str, Any]:
+    raw_legs = pattern.get("legs") or []
+    legs = []
+    transit_legs = []
+    for leg in raw_legs:
+        line = leg.get("line") or {}
+        dest_display = ((leg.get("fromEstimatedCall") or {}).get("destinationDisplay") or {}).get("frontText")
+        item = {
+            "mode": leg.get("mode"),
+            "line": line.get("publicCode"),
+            "line_name": line.get("name"),
+            "transport_mode": line.get("transportMode"),
+            "destination_display": dest_display,
+            "from": (leg.get("fromPlace") or {}).get("name"),
+            "to": (leg.get("toPlace") or {}).get("name"),
+            "aimed_departure_time": leg.get("aimedStartTime"),
+            "expected_departure_time": leg.get("expectedStartTime"),
+            "aimed_arrival_time": leg.get("aimedEndTime"),
+            "expected_arrival_time": leg.get("expectedEndTime"),
+            "duration_seconds": leg.get("duration"),
         }
+        legs.append(item)
+        mode = str(leg.get("mode") or "").lower()
+        if line.get("publicCode") or mode not in ("foot", "walk", "walking"):
+            transit_legs.append(item)
 
-    matches.sort(key=lambda d: d.get("expected_departure_time") or d.get("aimed_departure_time") or "")
-    nxt = matches[0]
-    aimed = nxt.get("aimed_departure_time")
-    expected = nxt.get("expected_departure_time") or aimed
+    first = transit_legs[0] if transit_legs else (legs[0] if legs else {})
+    aimed = first.get("aimed_departure_time")
+    expected = first.get("expected_departure_time") or aimed
     delay_seconds = None
     if aimed and expected:
         delay_seconds = round((datetime.fromisoformat(expected) - datetime.fromisoformat(aimed)).total_seconds())
 
     return {
-        "from_stop": board.get("stop_name") or stop["name"],
-        "destination": nxt.get("destination"),
-        "line": nxt.get("line"),
+        "expected_start_time": pattern.get("expectedStartTime"),
+        "expected_end_time": pattern.get("expectedEndTime"),
+        "duration_seconds": pattern.get("duration"),
+        "number_of_transit_legs": len(transit_legs),
+        "direct": len(transit_legs) == 1,
+        "first_line": first.get("line"),
+        "first_mode": first.get("transport_mode") or first.get("mode"),
+        "first_destination_display": first.get("destination_display"),
         "aimed_departure_time": aimed,
         "expected_departure_time": expected,
-        "realtime": bool(nxt.get("realtime")),
         "delay_seconds": delay_seconds,
-        "cancelled": bool(nxt.get("cancelled")),
-        "quay": nxt.get("quay"),
-        "retrieved_at": board.get("retrieved_at"),
-        "next_matches": matches[:3],
+        "legs": legs,
+    }
+
+
+@mcp.tool()
+def next_departure(from_stop: str, destination: str, line: str | None = None) -> dict[str, Any]:
+    """FAST PATH. Find the next real journey from a named stop to another named stop using Entur journey planning across bus, metro, tram, rail and transfers. The destination may be an intermediate stop, not just a vehicle headsign. Optional line filters the returned journey options when possible."""
+    origin = _search_stop(from_stop)
+    dest = _search_stop(destination)
+    patterns = [_normalise_trip(p) for p in _trip_patterns(origin["id"], dest["id"], 8)]
+
+    if line:
+        line_cf = line.casefold().strip()
+        filtered = []
+        for p in patterns:
+            if any(str(l.get("line") or "").casefold() == line_cf for l in p.get("legs", [])):
+                filtered.append(p)
+        if filtered:
+            patterns = filtered
+
+    patterns.sort(key=lambda p: p.get("expected_departure_time") or p.get("expected_start_time") or "")
+    if not patterns:
+        return {
+            "found": False,
+            "from_stop": origin["name"],
+            "to_stop": dest["name"],
+            "message": "Ingen reiser funnet akkurat nå.",
+            "retrieved_at": datetime.now().astimezone().isoformat(),
+        }
+
+    best = patterns[0]
+    return {
+        "found": True,
+        "from_stop": origin["name"],
+        "to_stop": dest["name"],
+        "line": best.get("first_line"),
+        "transport_mode": best.get("first_mode"),
+        "destination": best.get("first_destination_display") or dest["name"],
+        "aimed_departure_time": best.get("aimed_departure_time"),
+        "expected_departure_time": best.get("expected_departure_time"),
+        "expected_arrival_time": best.get("expected_end_time"),
+        "delay_seconds": best.get("delay_seconds"),
+        "direct": best.get("direct"),
+        "number_of_transit_legs": best.get("number_of_transit_legs"),
+        "legs": best.get("legs"),
+        "alternatives": patterns[1:4],
+        "retrieved_at": datetime.now().astimezone().isoformat(),
     }
 
 
@@ -224,10 +307,8 @@ def commute_home(min_transfer_minutes: int = 3) -> dict[str, Any]:
     for d in ul_board.get("departures", []):
         if d.get("cancelled"):
             continue
-        # Any metro departure whose destination is south/west of Ullevål will call at Majorstuen.
-        # Exclude clearly northbound destinations.
-        dest = (d.get("destination") or "").casefold()
-        if any(x in dest for x in ["vestli", "sognsvann", "frognerseteren", "storo"]):
+        dest_text = (d.get("destination") or "").casefold()
+        if any(x in dest_text for x in ["vestli", "sognsvann", "frognerseteren", "storo"]):
             continue
         if (d.get("transport_mode") or "").lower() != "metro":
             continue
@@ -243,8 +324,6 @@ def commute_home(min_transfer_minutes: int = 3) -> dict[str, Any]:
             u_dep = u.get("expected_departure_time") or u.get("aimed_departure_time")
             if not u_dep:
                 continue
-            # Entur departure-board at Ullevål does not guarantee the call-at-Majorstuen arrival in this response,
-            # so use the established ~4 minute runtime fallback and label it explicitly.
             arr_dt = datetime.fromisoformat(u_dep)
             estimated_arrival = arr_dt.timestamp() + 4 * 60
             target_ts = datetime.fromisoformat(target_dep).timestamp()
@@ -273,7 +352,6 @@ def commute_home(min_transfer_minutes: int = 3) -> dict[str, Any]:
             "retrieved_at": datetime.now().astimezone().isoformat(),
         }
 
-    # Latest Ullevål departure that still makes a viable line 3 connection.
     candidates.sort(key=lambda c: c["ulleval_departure"], reverse=True)
     best = candidates[0]
     return {
