@@ -1,5 +1,5 @@
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 import httpx
@@ -8,6 +8,7 @@ from mcp.server.mcpserver import MCPServer
 CLIENT_NAME = os.getenv("ENTUR_CLIENT_NAME", "bjornar-ruter-sanntid")
 GEOCODER_URL = "https://api.entur.io/geocoder/v3/autocomplete"
 JOURNEY_URL = "https://api.entur.io/journey-planner/v3/graphql"
+WORK_TO_ULLEVAL_MINUTES = float(os.getenv("WORK_TO_ULLEVAL_MINUTES", "5"))
 
 mcp = MCPServer("Bjørnars Entur Live")
 
@@ -365,85 +366,182 @@ def next_departure(
     }
 
 
+def _commute_boards(ulleval_id: str, majorstuen_id: str) -> dict[str, Any]:
+    # Relative next calls belong to this dated departure, including after midnight.
+    query = """
+    query Commute($ul: String!, $maj: String!) {
+      ulleval: stopPlace(id: $ul) {
+        estimatedCalls(numberOfDepartures: 100, timeRange: 10800, includeCancelledTrips: true,
+          filters: [{select: [{transportModes: [{transportMode: metro}]}]}]) {
+          ...CommuteCall
+          serviceJourneyEstimatedCalls {
+            next(count: 3) { ...OnwardCall }
+          }
+        }
+      }
+      majorstuen: stopPlace(id: $maj) {
+        estimatedCalls(numberOfDepartures: 100, timeRange: 10800, includeCancelledTrips: true,
+          filters: [{select: [{transportModes: [{transportMode: metro}]}]}]) {
+          ...CommuteCall
+          serviceJourneyEstimatedCalls {
+            next(count: 10) { ...OnwardCall }
+          }
+        }
+      }
+    }
+    fragment CommuteCall on EstimatedCall {
+      realtime cancellation forBoarding
+      aimedDepartureTime expectedDepartureTime
+      destinationDisplay { frontText }
+      serviceJourney { id line { publicCode transportMode } }
+    }
+    fragment OnwardCall on EstimatedCall {
+      realtime cancellation forAlighting
+      aimedArrivalTime expectedArrivalTime
+      quay { stopPlace { id name parent { id } } }
+    }
+    """
+    return _graphql(query, {"ul": ulleval_id, "maj": majorstuen_id})
+
+
+def _call_time(call: dict[str, Any], kind: str) -> datetime | None:
+    value = call.get(f"expected{kind}Time") or call.get(f"aimed{kind}Time")
+    return datetime.fromisoformat(value) if value else None
+
+
+def _onward_call(call: dict[str, Any], stop_id: str) -> dict[str, Any] | None:
+    for onward in (call.get("serviceJourneyEstimatedCalls") or {}).get("next") or []:
+        place = ((onward.get("quay") or {}).get("stopPlace") or {})
+        if stop_id in (place.get("id"), (place.get("parent") or {}).get("id")):
+            if onward.get("cancellation") or onward.get("forAlighting") is False:
+                return None
+            return onward
+    return None
+
+
+def _select_commute_options(
+    boards: dict[str, Any],
+    majorstuen_id: str,
+    ringstabekk_id: str,
+    now: datetime,
+    min_transfer_minutes: float,
+    walk_minutes: float,
+) -> list[dict[str, Any]]:
+    ready_at = now + timedelta(minutes=walk_minutes)
+    minimum_seconds = min_transfer_minutes * 60
+    incoming = []
+    for call in (boards.get("ulleval") or {}).get("estimatedCalls") or []:
+        journey = call.get("serviceJourney") or {}
+        line = journey.get("line") or {}
+        departure = _call_time(call, "Departure")
+        arrival_call = _onward_call(call, majorstuen_id)
+        arrival = _call_time(arrival_call, "Arrival") if arrival_call else None
+        if (
+            call.get("cancellation") or call.get("forBoarding") is False
+            or line.get("transportMode") != "metro"
+            or not departure or departure < ready_at
+            or not arrival or arrival <= departure
+        ):
+            continue
+        incoming.append((call, departure, arrival_call, arrival))
+
+    options = []
+    seen_targets = set()
+    targets = (boards.get("majorstuen") or {}).get("estimatedCalls") or []
+    targets = sorted(targets, key=lambda c: (_call_time(c, "Departure") or now).timestamp())
+    for target in targets:
+        journey = target.get("serviceJourney") or {}
+        line = journey.get("line") or {}
+        target_dep = _call_time(target, "Departure")
+        ring_call = _onward_call(target, ringstabekk_id)
+        ring_arrival = _call_time(ring_call, "Arrival") if ring_call else None
+        if (
+            target.get("cancellation") or target.get("forBoarding") is False
+            or line.get("transportMode") != "metro" or str(line.get("publicCode")) != "3"
+            or not target_dep or target_dep <= now
+            or not ring_arrival or ring_arrival <= target_dep
+        ):
+            continue
+        identity = (journey.get("id"), target_dep.isoformat())
+        if identity in seen_targets:
+            continue
+        seen_targets.add(identity)
+        feasible = [
+            (u, dep, arr_call, arr, (target_dep - arr).total_seconds())
+            for u, dep, arr_call, arr in incoming
+            if (target_dep - arr).total_seconds() >= minimum_seconds
+        ]
+        if not feasible:
+            continue
+        # Minimum wait for each upcoming line 3; latest Ullevål departure breaks ties.
+        u, dep, arr_call, arr, margin_seconds = min(
+            feasible, key=lambda item: (item[4], -item[1].timestamp())
+        )
+        u_line = (u.get("serviceJourney") or {}).get("line") or {}
+        leave_work = dep - timedelta(minutes=walk_minutes)
+        options.append({
+            "leave_work_at": leave_work.isoformat(),
+            "walk_to_station_minutes": walk_minutes,
+            "ulleval_departure": dep.isoformat(),
+            "ulleval_aimed_departure": u.get("aimedDepartureTime"),
+            "ulleval_line": u_line.get("publicCode"),
+            "ulleval_destination": (u.get("destinationDisplay") or {}).get("frontText"),
+            "ulleval_realtime": bool(u.get("realtime")),
+            "ulleval_service_journey_id": (u.get("serviceJourney") or {}).get("id"),
+            "majorstuen_arrival": arr.isoformat(),
+            "majorstuen_arrival_estimated": arr.isoformat(),
+            "majorstuen_arrival_basis": "entur_expected" if arr_call.get("realtime") else "entur_scheduled",
+            "majorstuen_arrival_realtime": bool(arr_call.get("realtime")),
+            "line3_departure": target_dep.isoformat(),
+            "line3_aimed_departure": target.get("aimedDepartureTime"),
+            "line3_destination": (target.get("destinationDisplay") or {}).get("frontText"),
+            "line3_realtime": bool(target.get("realtime")),
+            "line3_service_journey_id": journey.get("id"),
+            "ringstabekk_arrival": ring_arrival.isoformat(),
+            "ringstabekk_arrival_realtime": bool(ring_call.get("realtime")),
+            "transfer_margin_seconds": margin_seconds,
+            "transfer_margin_minutes": round(margin_seconds / 60, 2),
+        })
+        if len(options) == 3:
+            break
+    return options
+
+
 @mcp.tool()
-def commute_home(min_transfer_minutes: int = 3) -> dict[str, Any]:
-    """FAST PATH for Bjørnar's work commute. In one MCP call, recommend the latest sensible departure from Ullevål stadion to Majorstuen that still connects to line 3 toward Kolsås with at least the requested transfer margin. Prefer realtime expected times; fall back to ~4 min Ullevål→Majorstuen runtime when exact arrival is unavailable."""
+def commute_home(
+    min_transfer_minutes: float = 2,
+    walk_to_station_minutes: float | None = None,
+) -> dict[str, Any]:
+    """FAST PATH for 'Dra fra jobb'. Return the next three metro connections Ullevål stadion → Majorstuen → Ringstabekk, with line 3 westbound. For each upcoming line 3, minimise waiting at Majorstuen while keeping at least min_transfer_minutes (default 2) between Entur arrival and departure. Subtract the configured walk from work to the Ullevål platform to give leave_work_at. Use real dated stop calls; do not assume a fixed travel time. The margin includes time to change platforms. Report the recommendation and two alternatives in chronological order."""
+    walk = WORK_TO_ULLEVAL_MINUTES if walk_to_station_minutes is None else walk_to_station_minutes
+    if not 0 <= walk <= 120 or not 2 <= min_transfer_minutes <= 60:
+        raise ValueError("Gangtid må være 0–120 minutter og overgangsmargin 2–60 minutter.")
     ulleval = _search_stop("Ullevål stadion")
     majorstuen = _search_stop("Majorstuen")
-
-    ul_board = _departure_board(ulleval["id"], number_of_departures=60, time_range_seconds=10800)
-    maj_board = _departure_board(majorstuen["id"], number_of_departures=60, time_range_seconds=10800)
-
-    line3 = []
-    for d in maj_board.get("departures", []):
-        if d.get("cancelled"):
-            continue
-        if str(d.get("line") or "").strip() != "3":
-            continue
-        if "kolsås" not in (d.get("destination") or "").casefold():
-            continue
-        line3.append(d)
-    line3.sort(key=lambda d: d.get("expected_departure_time") or d.get("aimed_departure_time") or "")
-
-    southbound = []
-    for d in ul_board.get("departures", []):
-        if d.get("cancelled"):
-            continue
-        dest_text = (d.get("destination") or "").casefold()
-        if any(x in dest_text for x in ["vestli", "sognsvann", "frognerseteren", "storo"]):
-            continue
-        if (d.get("transport_mode") or "").lower() != "metro":
-            continue
-        southbound.append(d)
-    southbound.sort(key=lambda d: d.get("expected_departure_time") or d.get("aimed_departure_time") or "")
-
-    candidates = []
-    for target in line3[:8]:
-        target_dep = target.get("expected_departure_time") or target.get("aimed_departure_time")
-        if not target_dep:
-            continue
-        for u in southbound[:20]:
-            u_dep = u.get("expected_departure_time") or u.get("aimed_departure_time")
-            if not u_dep:
-                continue
-            arr_dt = datetime.fromisoformat(u_dep)
-            estimated_arrival = arr_dt.timestamp() + 4 * 60
-            target_ts = datetime.fromisoformat(target_dep).timestamp()
-            margin = (target_ts - estimated_arrival) / 60.0
-            if margin >= min_transfer_minutes:
-                candidates.append(
-                    {
-                        "ulleval_departure": u_dep,
-                        "ulleval_line": u.get("line"),
-                        "ulleval_destination": u.get("destination"),
-                        "ulleval_realtime": bool(u.get("realtime")),
-                        "majorstuen_arrival_estimated": datetime.fromtimestamp(estimated_arrival, tz=datetime.fromisoformat(u_dep).tzinfo).isoformat(),
-                        "majorstuen_arrival_basis": "fallback_runtime_4_min",
-                        "line3_departure": target_dep,
-                        "line3_realtime": bool(target.get("realtime")),
-                        "line3_aimed_departure": target.get("aimed_departure_time"),
-                        "transfer_margin_minutes": round(margin, 1),
-                    }
-                )
-
-    if not candidates:
-        return {
-            "found": False,
-            "message": "Fant ingen forbindelse med ønsket overgangsmargin i søkevinduet.",
-            "min_transfer_minutes": min_transfer_minutes,
-            "retrieved_at": datetime.now().astimezone().isoformat(),
-        }
-
-    candidates.sort(key=lambda c: c["ulleval_departure"], reverse=True)
-    best = candidates[0]
-    return {
-        "found": True,
-        "recommendation": best,
-        "alternatives": candidates[1:4],
+    ringstabekk = _search_stop("Ringstabekk")
+    boards = _commute_boards(ulleval["id"], majorstuen["id"])
+    now = datetime.now().astimezone()
+    options = _select_commute_options(
+        boards, majorstuen["id"], ringstabekk["id"], now, min_transfer_minutes, walk
+    )
+    result = {
+        "found": bool(options),
+        "from_stop": ulleval["name"],
+        "via_stop": majorstuen["name"],
+        "to_stop": ringstabekk["name"],
         "min_transfer_minutes": min_transfer_minutes,
-        "note": "Majorstuen-arrival uses the established ~4 minute fallback runtime; departure times use Entur expected/realtime data when available.",
+        "walk_to_station_minutes": walk,
+        "number_of_options": len(options),
         "retrieved_at": datetime.now().astimezone().isoformat(),
+        "note": "Overgangsmarginen er tiden fra ankomst til avgang på Majorstuen, inkludert plattformbytte. Tidene er Enturs forventede tider når sanntid finnes, ellers rutetider.",
     }
+    if options:
+        result["recommendation"] = options[0]
+        result["alternatives"] = options[1:3]
+    else:
+        result["message"] = "Fant ingen kommende forbindelse med ønsket overgangsmargin og gangtid i søkevinduet."
+        result["alternatives"] = []
+    return result
 
 
 @mcp.tool()
