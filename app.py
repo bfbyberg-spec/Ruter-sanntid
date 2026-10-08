@@ -220,12 +220,17 @@ def _normalise_trip(pattern: dict[str, Any]) -> dict[str, Any]:
             "aimed_arrival_time": leg.get("aimedEndTime"),
             "expected_arrival_time": leg.get("expectedEndTime"),
             "duration_seconds": leg.get("duration"),
-            "service_journey_id": (leg.get("serviceJourney") or {}).get("id"),
-            "realtime": bool(leg.get("realtime")),
-            "departure_realtime": bool((leg.get("fromEstimatedCall") or {}).get("realtime")),
-            "arrival_realtime": bool((leg.get("toEstimatedCall") or {}).get("realtime")),
-            "cancelled": bool((leg.get("fromEstimatedCall") or {}).get("cancellation") or (leg.get("toEstimatedCall") or {}).get("cancellation")),
         }
+        # Only expose these flags when the query actually requested them.
+        # Older point-to-point responses retain their existing shape.
+        if "realtime" in leg:
+            item.update({
+                "service_journey_id": (leg.get("serviceJourney") or {}).get("id"),
+                "realtime": bool(leg.get("realtime")),
+                "departure_realtime": bool((leg.get("fromEstimatedCall") or {}).get("realtime")),
+                "arrival_realtime": bool((leg.get("toEstimatedCall") or {}).get("realtime")),
+                "cancelled": bool((leg.get("fromEstimatedCall") or {}).get("cancellation") or (leg.get("toEstimatedCall") or {}).get("cancellation")),
+            })
         legs.append(item)
         mode = str(leg.get("mode") or "").lower()
         if line.get("publicCode") or mode not in ("foot", "walk", "walking"):
@@ -774,3 +779,4 @@ if __name__ == "__main__":
         stateless_http=True,
         json_response=True,
     )
+
