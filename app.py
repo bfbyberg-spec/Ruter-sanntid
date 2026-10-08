@@ -52,8 +52,6 @@ def _search_stop(name: str) -> dict[str, Any]:
     if not features:
         raise ValueError(f"Fant ikke stoppested: {name}")
 
-    # Prefer a result that actually represents public transport; metro gets a slight
-    # preference only when otherwise equivalent. Mixed stops (bus+metro) are retained.
     def score(feature: dict[str, Any]) -> tuple[int, int]:
         p = feature.get("properties", {})
         modes_raw = p.get("transportModes") or []
@@ -149,13 +147,25 @@ def _departure_board(stop_place_id: str, number_of_departures: int = 40, time_ra
     }
 
 
-def _trip_patterns(from_stop_id: str, to_stop_id: str, num_patterns: int = 6) -> list[dict[str, Any]]:
-    # IDs are canonical Entur IDs returned by our own geocoder, not user supplied text.
+def _trip_patterns(
+    from_stop_id: str,
+    to_stop_id: str,
+    num_patterns: int = 6,
+    transport_mode: str | None = None,
+) -> list[dict[str, Any]]:
+    mode_clause = ""
+    if transport_mode:
+        mode_clause = (
+            "modes: { accessMode: foot, egressMode: foot, directMode: foot, "
+            f"transportModes: [{{ transportMode: {transport_mode} }}] }}"
+        )
+
     query = f"""
     {{
       trip(
         from: {{ place: \"{from_stop_id}\" }}
         to: {{ place: \"{to_stop_id}\" }}
+        {mode_clause}
         numTripPatterns: {max(1, min(num_patterns, 10))}
       ) {{
         tripPatterns {{
@@ -237,14 +247,40 @@ def _normalise_trip(pattern: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _mode_from_filter(value: str | None) -> str | None:
+    if not value:
+        return None
+    v = value.casefold().strip().replace("-", " ")
+    aliases = {
+        "metro": "metro",
+        "bane": "metro",
+        "t bane": "metro",
+        "tbane": "metro",
+        "subway": "metro",
+        "bus": "bus",
+        "buss": "bus",
+        "tram": "tram",
+        "trikk": "tram",
+        "rail": "rail",
+        "tog": "rail",
+        "train": "rail",
+    }
+    return aliases.get(v)
+
+
 @mcp.tool()
 def next_departure(from_stop: str, destination: str, line: str | None = None) -> dict[str, Any]:
-    """FAST PATH. Find the next real journey from a named stop to another named stop using Entur journey planning across bus, metro, tram, rail and transfers. The destination may be an intermediate stop, not just a vehicle headsign. Optional line filters the returned journey options when possible."""
+    """FAST PATH. Find the next real journey from a named stop to another named stop. Optional line can be a line number, or a mode word such as metro/bane/T-bane, bus/buss, tram/trikk or rail/tog to restrict the journey search."""
     origin = _search_stop(from_stop)
     dest = _search_stop(destination)
-    patterns = [_normalise_trip(p) for p in _trip_patterns(origin["id"], dest["id"], 8)]
 
-    if line:
+    mode_filter = _mode_from_filter(line)
+    patterns = [
+        _normalise_trip(p)
+        for p in _trip_patterns(origin["id"], dest["id"], 8, transport_mode=mode_filter)
+    ]
+
+    if line and not mode_filter:
         line_cf = line.casefold().strip()
         filtered = []
         for p in patterns:
@@ -253,13 +289,24 @@ def next_departure(from_stop: str, destination: str, line: str | None = None) ->
         if filtered:
             patterns = filtered
 
+    if mode_filter:
+        # Defensive post-filter in addition to the OTP mode restriction.
+        filtered = []
+        for p in patterns:
+            transit = [l for l in p.get("legs", []) if l.get("line")]
+            if transit and all(str(l.get("transport_mode") or l.get("mode") or "").casefold() == mode_filter for l in transit):
+                filtered.append(p)
+        patterns = filtered
+
     patterns.sort(key=lambda p: p.get("expected_departure_time") or p.get("expected_start_time") or "")
     if not patterns:
         return {
             "found": False,
             "from_stop": origin["name"],
             "to_stop": dest["name"],
-            "message": "Ingen reiser funnet akkurat nå.",
+            "mode_filter": mode_filter,
+            "line_filter": None if mode_filter else line,
+            "message": "Ingen reiser funnet akkurat nå med valgt filter.",
             "retrieved_at": datetime.now().astimezone().isoformat(),
         }
 
@@ -268,6 +315,8 @@ def next_departure(from_stop: str, destination: str, line: str | None = None) ->
         "found": True,
         "from_stop": origin["name"],
         "to_stop": dest["name"],
+        "mode_filter": mode_filter,
+        "line_filter": None if mode_filter else line,
         "line": best.get("first_line"),
         "transport_mode": best.get("first_mode"),
         "destination": best.get("first_destination_display") or dest["name"],
