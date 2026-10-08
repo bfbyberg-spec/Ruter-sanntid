@@ -220,6 +220,11 @@ def _normalise_trip(pattern: dict[str, Any]) -> dict[str, Any]:
             "aimed_arrival_time": leg.get("aimedEndTime"),
             "expected_arrival_time": leg.get("expectedEndTime"),
             "duration_seconds": leg.get("duration"),
+            "service_journey_id": (leg.get("serviceJourney") or {}).get("id"),
+            "realtime": bool(leg.get("realtime")),
+            "departure_realtime": bool((leg.get("fromEstimatedCall") or {}).get("realtime")),
+            "arrival_realtime": bool((leg.get("toEstimatedCall") or {}).get("realtime")),
+            "cancelled": bool((leg.get("fromEstimatedCall") or {}).get("cancellation") or (leg.get("toEstimatedCall") or {}).get("cancellation")),
         }
         legs.append(item)
         mode = str(leg.get("mode") or "").lower()
@@ -294,6 +299,11 @@ def next_departure(
     transport_mode: str | None = None,
 ) -> dict[str, Any]:
     """FAST PATH. Find the next real point-to-point journey. Set transport_mode='metro' for only T-bane, 'bus' for only buses, 'tram', 'rail', 'coach', 'water' or 'air'; Norwegian aliases are accepted. Omit transport_mode for all modes. Optional line restricts journeys to those containing that line, while transfers may use other lines of the selected mode. Legacy mode words in line (metro/bane/T-bane, bus/buss, tram/trikk, rail/tog) remain supported. Never substitute a different mode when no matching journey exists."""
+    # Keep the shortcut callable by hosts whose tool catalogue predates switch_at_smestad.
+    if line and line.strip().casefold() in ("bytte", "bytte?"):
+        if from_stop.strip().casefold() != "ringstabekk" or destination.strip().casefold() != "ullevål stadion" or transport_mode:
+            raise ValueError("Bytte?-snarveien gjelder Ringstabekk → Ullevål stadion uten transportfilter.")
+        return switch_at_smestad()
     mode_filter = _mode_from_filter(transport_mode)
     legacy_mode = None
     line_filter = line.strip() if line else None
@@ -541,6 +551,204 @@ def commute_home(
     else:
         result["message"] = "Fant ingen kommende forbindelse med ønsket overgangsmargin og gangtid i søkevinduet."
         result["alternatives"] = []
+    return result
+
+
+def _switch_origin_train(ring_id: str, smestad_id: str, majorstuen_id: str) -> dict[str, Any] | None:
+    query = """
+    query NextRingTrain($id: String!) {
+      stopPlace(id: $id) {
+        estimatedCalls(numberOfDepartures: 30, timeRange: 10800,
+          filters: [{select: [{transportModes: [{transportMode: metro}]}]}]) {
+          realtime cancellation forBoarding
+          aimedDepartureTime expectedDepartureTime
+          destinationDisplay { frontText }
+          serviceJourney { id line { publicCode transportMode } }
+          serviceJourneyEstimatedCalls {
+            next(count: 10) {
+              realtime cancellation forAlighting
+              aimedArrivalTime expectedArrivalTime
+              quay { id stopPlace { id name parent { id } } }
+            }
+          }
+        }
+      }
+    }
+    """
+    data = _graphql(query, {"id": ring_id})
+    return _select_switch_origin_train(data, smestad_id, majorstuen_id, datetime.now().astimezone())
+
+
+def _select_switch_origin_train(data: dict[str, Any], smestad_id: str, majorstuen_id: str, now: datetime) -> dict[str, Any] | None:
+    calls = (data.get("stopPlace") or {}).get("estimatedCalls") or []
+    calls = sorted(calls, key=lambda c: (_call_time(c, "Departure") or now).timestamp())
+    for call in calls:
+        departure = _call_time(call, "Departure")
+        line = (call.get("serviceJourney") or {}).get("line") or {}
+        if call.get("cancellation") or call.get("forBoarding") is False or not departure or departure < now or line.get("transportMode") != "metro":
+            continue
+        smestad = _onward_call(call, smestad_id)
+        majorstuen = _onward_call(call, majorstuen_id)
+        smestad_at = _call_time(smestad, "Arrival") if smestad else None
+        majorstuen_at = _call_time(majorstuen, "Arrival") if majorstuen else None
+        if smestad_at and majorstuen_at and departure < smestad_at < majorstuen_at:
+            return {
+                "line": line.get("publicCode"),
+                "destination": (call.get("destinationDisplay") or {}).get("frontText"),
+                "service_journey_id": (call.get("serviceJourney") or {}).get("id"),
+                "ringstabekk_departure": departure.isoformat(),
+                "ringstabekk_departure_realtime": bool(call.get("realtime")),
+                "smestad_arrival": smestad_at.isoformat(),
+                "smestad_arrival_realtime": bool(smestad.get("realtime")),
+                "smestad_metro_stop_id": ((smestad.get("quay") or {}).get("stopPlace") or {}).get("id"),
+                "majorstuen_arrival": majorstuen_at.isoformat(),
+                "majorstuen_arrival_realtime": bool(majorstuen.get("realtime")),
+            }
+    return None
+
+
+def _switch_trip_patterns(from_id: str, to_id: str, date_time: str, mode: str) -> list[dict[str, Any]]:
+    # Starting at the metro child stop includes the actual walk to the bus stop.
+    query = """
+    query SwitchTrips($from: String!, $to: String!, $at: DateTime!, $mode: TransportMode!) {
+      trip(from: {place: $from}, to: {place: $to}, dateTime: $at,
+        modes: {accessMode: foot, egressMode: foot, directMode: foot,
+          transportModes: [{transportMode: $mode}]}, numTripPatterns: 10) {
+        tripPatterns {
+          duration expectedStartTime expectedEndTime
+          legs {
+            mode realtime duration aimedStartTime expectedStartTime aimedEndTime expectedEndTime
+            fromPlace { name } toPlace { name }
+            line { publicCode name transportMode }
+            serviceJourney { id }
+            fromEstimatedCall { realtime cancellation destinationDisplay { frontText } }
+            toEstimatedCall { realtime cancellation }
+          }
+        }
+      }
+    }
+    """
+    data = _graphql(query, {"from": from_id, "to": to_id, "at": date_time, "mode": _mode_from_filter(mode)})
+    return [_normalise_trip(p) for p in (data.get("trip") or {}).get("tripPatterns") or []]
+
+
+def _leg_time(leg: dict[str, Any], kind: str) -> datetime | None:
+    value = leg.get(f"expected_{kind}_time") or leg.get(f"aimed_{kind}_time")
+    return datetime.fromisoformat(value) if value else None
+
+
+def _switch_metro_option(train: dict[str, Any], patterns: list[dict[str, Any]]) -> dict[str, Any] | None:
+    maj_arrival = datetime.fromisoformat(train["majorstuen_arrival"])
+    feasible = []
+    for pattern in patterns:
+        transit = _transit_legs(pattern)
+        if len(transit) != 2 or any(l.get("cancelled") or (l.get("transport_mode") or l.get("mode")) != "metro" for l in transit):
+            continue
+        first, second = transit
+        if first.get("from") != "Smestad" or first.get("to") != "Majorstuen" or second.get("from") != "Majorstuen" or second.get("to") != "Ullevål stadion":
+            continue
+        legs = pattern["legs"]
+        first_index, second_index = legs.index(first), legs.index(second)
+        walk_seconds = sum(l.get("duration_seconds") or 0 for l in legs[first_index + 1:second_index])
+        # Evaluate the onward metro from the assumed train's arrival, never from
+        # another train's arrival. This also handles a later planner first leg
+        # sharing the same onward metro while the user stays on the original train.
+        departure = _leg_time(second, "departure")
+        arrival = _leg_time(second, "arrival")
+        if not departure or not arrival or arrival <= departure or departure < maj_arrival + timedelta(seconds=walk_seconds):
+            continue
+        feasible.append({
+            "line": second.get("line"), "destination": second.get("destination_display"),
+            "majorstuen_departure": departure.isoformat(),
+            "majorstuen_arrival": train["majorstuen_arrival"],
+            "transfer_walk_seconds": walk_seconds,
+            "transfer_margin_seconds": (departure - maj_arrival).total_seconds(),
+            "ulleval_arrival": arrival.isoformat(),
+            "departure_realtime": bool(second.get("departure_realtime")),
+            "arrival_realtime": bool(second.get("arrival_realtime")),
+            "service_journey_id": second.get("service_journey_id"),
+        })
+    return min(feasible, key=lambda p: datetime.fromisoformat(p["ulleval_arrival"])) if feasible else None
+
+
+def _switch_bus_option(train: dict[str, Any], patterns: list[dict[str, Any]], buffer_minutes: float) -> dict[str, Any] | None:
+    smestad_arrival = datetime.fromisoformat(train["smestad_arrival"])
+    feasible = []
+    for pattern in patterns:
+        transit = _transit_legs(pattern)
+        if len(transit) != 1:
+            continue
+        bus = transit[0]
+        if bus.get("cancelled") or (bus.get("transport_mode") or bus.get("mode")) != "bus" or bus.get("from") != "Smestad" or bus.get("to") != "Ullevål stadion":
+            continue
+        initial = pattern["legs"][:pattern["legs"].index(bus)]
+        # Reject paths without a verified walk from the metro child stop to the bus stop.
+        walk_seconds = sum(l.get("duration_seconds") or 0 for l in initial)
+        if walk_seconds <= 0:
+            continue
+        ready = smestad_arrival + timedelta(seconds=walk_seconds, minutes=buffer_minutes)
+        departure = _leg_time(bus, "departure")
+        arrival = _leg_time(bus, "arrival")
+        if not departure or not arrival or departure < ready or arrival <= departure:
+            continue
+        feasible.append({
+            "line": bus.get("line"), "destination": bus.get("destination_display"),
+            "smestad_departure": departure.isoformat(),
+            "aimed_departure": bus.get("aimed_departure_time"),
+            "delay_seconds": pattern.get("delay_seconds"),
+            "walk_to_bus_seconds": walk_seconds,
+            "bus_ready_at": ready.isoformat(),
+            "boarding_margin_after_walk_seconds": (departure - smestad_arrival).total_seconds() - walk_seconds,
+            "ulleval_arrival": arrival.isoformat(),
+            "departure_realtime": bool(bus.get("departure_realtime")),
+            "arrival_realtime": bool(bus.get("arrival_realtime")),
+            "service_journey_id": bus.get("service_journey_id"),
+        })
+    # Prefer a live option; a timetable-only result is shown as provisional.
+    live = [p for p in feasible if p["departure_realtime"] and p["arrival_realtime"]]
+    candidates = live or feasible
+    return min(candidates, key=lambda p: datetime.fromisoformat(p["ulleval_arrival"])) if candidates else None
+
+
+def _switch_decision(train: dict[str, Any], bus_patterns: list[dict[str, Any]], metro_patterns: list[dict[str, Any]], buffer_minutes: float) -> dict[str, Any]:
+    bus = _switch_bus_option(train, bus_patterns, buffer_minutes)
+    metro = _switch_metro_option(train, metro_patterns)
+    gain = None
+    recommendation = "stay_on_metro"
+    reason = "no_reachable_bus"
+    if not metro:
+        recommendation, reason = "undetermined", "metro_comparison_unavailable"
+    elif bus:
+        gain = (datetime.fromisoformat(metro["ulleval_arrival"]) - datetime.fromisoformat(bus["ulleval_arrival"])).total_seconds()
+        if not bus["departure_realtime"] or not bus["arrival_realtime"]:
+            reason = "bus_has_no_live_prediction"
+        elif gain > 0:
+            recommendation, reason = "switch_to_bus", "bus_arrives_earlier"
+        else:
+            reason = "metro_arrives_no_later"
+    return {
+        "found": bool(metro), "recommendation": recommendation, "reason": reason,
+        "assumed_train": train, "bus": bus, "metro": metro,
+        "bus_time_gain_seconds": gain,
+        "bus_time_gain_minutes": round(gain / 60, 2) if gain is not None else None,
+        "bus_buffer_minutes": buffer_minutes,
+    }
+
+
+@mcp.tool()
+def switch_at_smestad(bus_buffer_minutes: float = 1) -> dict[str, Any]:
+    """FAST PATH for 'Bytte?'. Assume the next citybound metro from Ringstabekk is the user's train. Compare its actual Smestad arrival with live direct buses to Ullevål stadion, including Entur's walk from the metro stop and one minute extra boarding margin. Compare with staying on that same train to Majorstuen and taking the earliest reachable metro to Ullevål. Recommend the bus only when reachable and live departure/arrival predictions show an earlier arrival; prefer metro on ties or missing bus realtime. Report the assumed Smestad arrival, both options and the time difference."""
+    if not 0 <= bus_buffer_minutes <= 30:
+        raise ValueError("Ekstra margin ved bussen må være 0–30 minutter.")
+    ring, smestad, majorstuen, ulleval = [_search_stop(n) for n in ("Ringstabekk", "Smestad", "Majorstuen", "Ullevål stadion")]
+    train = _switch_origin_train(ring["id"], smestad["id"], majorstuen["id"])
+    if not train or not train.get("smestad_metro_stop_id"):
+        return {"found": False, "recommendation": "undetermined", "message": "Fant ikke neste bane fra Ringstabekk mot Smestad og Majorstuen.", "retrieved_at": datetime.now().astimezone().isoformat()}
+    metro_patterns = _switch_trip_patterns(train["smestad_metro_stop_id"], ulleval["id"], train["smestad_arrival"], "metro")
+    bus_patterns = _switch_trip_patterns(train["smestad_metro_stop_id"], ulleval["id"], train["smestad_arrival"], "bus")
+    result = _switch_decision(train, bus_patterns, metro_patterns, bus_buffer_minutes)
+    result["retrieved_at"] = datetime.now().astimezone().isoformat()
+    result["assumption"] = "Ankomst Smestad med neste bane fra Ringstabekk mot sentrum."
     return result
 
 
