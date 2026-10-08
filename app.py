@@ -3,17 +3,13 @@ from datetime import datetime
 from typing import Any
 
 import httpx
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 CLIENT_NAME = os.getenv("ENTUR_CLIENT_NAME", "bjornar-ruter-sanntid")
 GEOCODER_URL = "https://api.entur.io/geocoder/v3/autocomplete"
 JOURNEY_URL = "https://api.entur.io/journey-planner/v3/graphql"
 
-mcp = FastMCP(
-    "Bjørnars Entur Live",
-    host="0.0.0.0",
-    port=int(os.getenv("PORT", "8000")),
-)
+mcp = MCPServer("Bjørnars Entur Live")
 
 HEADERS = {
     "ET-Client-Name": CLIENT_NAME,
@@ -126,4 +122,11 @@ def departures(stop_place_id: str, number_of_departures: int = 20, time_range_se
 
 
 if __name__ == "__main__":
-    mcp.run(transport="streamable-http")
+    mcp.run(
+        transport="streamable-http",
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "8000")),
+        streamable_http_path="/mcp",
+        stateless_http=True,
+        json_response=True,
+    )
